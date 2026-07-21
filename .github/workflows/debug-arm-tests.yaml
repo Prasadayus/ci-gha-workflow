@@ -1,0 +1,136 @@
+name: Debug ARM Test Repro (SIMD dispatch A/B)
+
+# Pinpoints WHICH runtime-dispatched NEON kernel miscomputes on the
+# windows-11-arm runner (Neoverse-N2). The SAME binary is run repeatedly with
+# OPENCV_CPU_DISABLE toggled -- no rebuild between runs. If a config turns the
+# known-failing tests GREEN, that disabled feature's kernel is the culprit.
+#
+# Covers ALL 8 modules that fail on CI (imgproc, core, objdetect, ptcloud,
+# geometry, video, stitching, dnn), each with only its CI-failing cases.
+#
+# Context: same commit/compiler/flags/seed PASS on Snapdragon X Elite (Oryon)
+# locally; they FAIL here. Only variable left = the CPU's dispatched kernel.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "opencv branch/commit to build"
+        default: "5.x"
+      imgproc_seed:
+        description: "OPENCV_TEST_SEED for imgproc (CI's was 0xc5aca)"
+        default: "0x00000000000c5aca"
+      core_seed:
+        description: "OPENCV_TEST_SEED for core (CI's was 0xc5a61)"
+        default: "0x00000000000c5a61"
+
+jobs:
+  repro:
+    runs-on: windows-11-arm
+    steps:
+      - name: CPU / system fingerprint
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_Processor | Format-List Name,Manufacturer,Description,NumberOfCores,NumberOfLogicalProcessors,AddressWidth,MaxClockSpeed
+          Get-CimInstance Win32_OperatingSystem | Format-List Caption,Version,BuildNumber
+
+      - name: Checkout opencv
+        uses: actions/checkout@v4
+        with: { repository: opencv/opencv, ref: '${{ inputs.branch }}', path: opencv }
+      - name: Checkout opencv_extra
+        uses: actions/checkout@v4
+        with: { repository: opencv/opencv_extra, ref: '${{ inputs.branch }}', path: opencv_extra }
+
+      - name: Remove MinGW from PATH (the build fix)
+        shell: bash
+        run: echo "PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -i '/mingw' | paste -sd ':')" >> "$GITHUB_ENV"
+
+      - name: Print opencv commit
+        shell: bash
+        run: git -C opencv describe --tags
+
+      - name: Configure + build the 8 failing test modules
+        shell: bash
+        run: |
+          cmake -S opencv -B build -G "Visual Studio 17 2022" -A ARM64 \
+            -DCL_Z_OPTION=/Z7 -DOPENCV_ENABLE_NONFREE=ON -DCMAKE_BUILD_TYPE=Release \
+            -DWITH_OPENCL=OFF -DBUILD_EXAMPLES=OFF -DBUILD_PERF_TESTS=OFF
+          cmake --build build --config Release \
+            --target opencv_test_imgproc opencv_test_core opencv_test_objdetect \
+                     opencv_test_ptcloud opencv_test_geometry opencv_test_video \
+                     opencv_test_stitching opencv_test_dnn
+
+      - name: A/B — run all 8 modules' failing tests with OPENCV_CPU_DISABLE toggled
+        shell: pwsh
+        run: |
+          $env:OPENCV_TEST_DATA_PATH           = "${{ github.workspace }}/opencv_extra/testdata"
+          $env:OPENCV_TEST_REQUIRE_DATA        = "0"
+          $env:OPENCV_TEST_CHECK_OPTIONAL_DATA = "0"
+          $env:OPENCV_FOR_THREADS_NUM          = "4"
+          New-Item -ItemType Directory -Force logs | Out-Null
+
+          $bin = "build/bin/Release"
+          $imgSeed  = "${{ inputs.imgproc_seed }}"
+          $coreSeed = "${{ inputs.core_seed }}"
+
+          # module -> { exe, filter (only its CI-failing cases), seed }
+          $modules = @(
+            @{ name="imgproc";   exe="$bin/opencv_test_imgproc.exe";   seed=$imgSeed;  filter="*ColorYUV*:Imgproc_Remap.accuracy:*FindTRUContours*:*RemapRelative*:*MatchTemplateWithMask*:*Equalize_Hist*" }
+            @{ name="core";      exe="$bin/opencv_test_core.exe";      seed=$coreSeed; filter="Core_Reduce.accuracy" }
+            @{ name="objdetect"; exe="$bin/opencv_test_objdetect.exe"; seed=$imgSeed;  filter="CV_InvertedArucoDetection*.algorithmic:CV_Aruco3BoardPose.accuracy:CV_CharucoPoseEstimation.*:Objdetect_QRCode_Encode_Decode.regression" }
+            @{ name="ptcloud";   exe="$bin/opencv_test_ptcloud.exe";   seed=$imgSeed;  filter="*VolumeTestFixture.fetch_normals*" }
+            @{ name="geometry";  exe="$bin/opencv_test_geometry.exe";  seed=$imgSeed;  filter="Calib3d_InitUndistortMap.accuracy" }
+            @{ name="video";     exe="$bin/opencv_test_video.exe";     seed=$imgSeed;  filter="*Video_ECC.accuracy*" }
+            @{ name="stitching"; exe="$bin/opencv_test_stitching.exe"; seed=$imgSeed;  filter="ImageStitcher.setTransform" }
+            @{ name="dnn";       exe="$bin/opencv_test_dnn.exe";       seed=$imgSeed;  filter="*TESTKVCache.layouts*" }
+          )
+
+          # config label -> OPENCV_CPU_DISABLE value ("" = nothing disabled = baseline)
+          $configs = [ordered]@{
+            "00_baseline"        = ""
+            "01_disable_ALL"     = "NEON_FP16,NEON_BF16,NEON_DOTPROD"
+            "02_disable_FP16"    = "NEON_FP16"
+            "03_disable_BF16"    = "NEON_BF16"
+            "04_disable_DOTPROD" = "NEON_DOTPROD"
+          }
+
+          $results = @{}   # key "module|config" -> "pass/fail" string
+          foreach ($cfg in $configs.Keys) {
+            $env:OPENCV_CPU_DISABLE = $configs[$cfg]
+            Write-Host "======================================================"
+            Write-Host "CONFIG $cfg   OPENCV_CPU_DISABLE='$($configs[$cfg])'"
+            Write-Host "======================================================"
+            foreach ($m in $modules) {
+              $env:OPENCV_TEST_SEED = $m.seed
+              $log = "logs/${cfg}_$($m.name).log"
+              & $m.exe --skip_unstable=1 --gtest_filter="$($m.filter)" *> $log
+
+              $fLine = Select-String $log -Pattern "^\[  FAILED  \] (\d+) test" | Select-Object -First 1
+              $pLine = Select-String $log -Pattern "^\[  PASSED  \] (\d+) test" | Select-Object -First 1
+              $fails = if ($fLine) { [int]$fLine.Matches[0].Groups[1].Value } else { 0 }
+              $pass  = if ($pLine) { [int]$pLine.Matches[0].Groups[1].Value } else { 0 }
+              $results["$($m.name)|$cfg"] = "$pass/$fails"
+              Write-Host ("  {0,-10} passed={1,-4} failed={2}" -f $m.name, $pass, $fails)
+            }
+          }
+
+          # pivot table: one row per module, one column per config (cell = passed/failed)
+          $rows = @()
+          foreach ($m in $modules) {
+            $row = [ordered]@{ Module = $m.name }
+            foreach ($cfg in $configs.Keys) { $row[$cfg] = $results["$($m.name)|$cfg"] }
+            $rows += [pscustomobject]$row
+          }
+
+          Write-Host ""
+          Write-Host "################  SUMMARY (cell = passed/failed)  ################"
+          $rows | Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Host
+          Write-Host "Baseline (00) should show failures. The config that drops a module's"
+          Write-Host "'failed' to 0 identifies the broken dispatched kernel for that module."
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-simd-ab-logs
+          path: logs/
