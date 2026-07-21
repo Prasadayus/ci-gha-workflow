@@ -169,6 +169,84 @@ jobs:
         suffix: '${{ matrix.arch }}_${{ matrix.branch }}'
         timeout: 15
 
+    # ============================================================
+    # TEMPORARY diagnostic — REVERT before the upstream PR.
+    # Re-runs the known-failing tests against the ALREADY-BUILT binaries with
+    # OPENCV_CPU_DISABLE toggled to pinpoint WHICH dispatched NEON kernel
+    # (FP16 / BF16 / DOTPROD) miscomputes on the Neoverse-N2 runner.
+    # A config whose column drops a module's "failed" to 0 = the culprit.
+    # ============================================================
+    - name: SIMD dispatch A/B diagnostic (ARM64, TEMPORARY)
+      if: ${{ always() && matrix.arch == 'arm64' }}
+      shell: pwsh
+      working-directory: '${{ github.workspace }}'
+      run: |
+        $env:OPENCV_TEST_DATA_PATH           = "${{ github.workspace }}/opencv_extra/testdata"
+        $env:OPENCV_TEST_REQUIRE_DATA        = "0"
+        $env:OPENCV_TEST_CHECK_OPTIONAL_DATA = "0"
+        $env:OPENCV_FOR_THREADS_NUM          = "4"
+        $bin = "build/bin/Release"
+        New-Item -ItemType Directory -Force ab_logs | Out-Null
+
+        $imgSeed = "0x00000000000c5aca"; $coreSeed = "0x00000000000c5a61"
+        $modules = @(
+          @{ name="imgproc";   exe="$bin/opencv_test_imgproc.exe";   seed=$imgSeed;  filter="*ColorYUV*:Imgproc_Remap.accuracy:*FindTRUContours*:*RemapRelative*:*MatchTemplateWithMask*:*Equalize_Hist*" }
+          @{ name="core";      exe="$bin/opencv_test_core.exe";      seed=$coreSeed; filter="Core_Reduce.accuracy" }
+          @{ name="objdetect"; exe="$bin/opencv_test_objdetect.exe"; seed=$imgSeed;  filter="CV_*Aruco*:CV_*Charuco*:CV_*April*:Objdetect_QRCode_Encode_Decode.regression" }
+          @{ name="ptcloud";   exe="$bin/opencv_test_ptcloud.exe";   seed=$imgSeed;  filter="*VolumeTestFixture.fetch_normals*" }
+          @{ name="geometry";  exe="$bin/opencv_test_geometry.exe";  seed=$imgSeed;  filter="Calib3d_InitUndistortMap.accuracy:Calib3d_UndistortImgproc.accuracy" }
+          @{ name="video";     exe="$bin/opencv_test_video.exe";     seed=$imgSeed;  filter="*Video_ECC.accuracy*" }
+          @{ name="stitching"; exe="$bin/opencv_test_stitching.exe"; seed=$imgSeed;  filter="ImageStitcher.setTransform" }
+          @{ name="dnn";       exe="$bin/opencv_test_dnn.exe";       seed=$imgSeed;  filter="*TESTKVCache.layouts*" }
+        )
+        $configs = [ordered]@{
+          "00_baseline"        = ""
+          "01_disable_ALL"     = "NEON_FP16,NEON_BF16,NEON_DOTPROD"
+          "02_disable_FP16"    = "NEON_FP16"
+          "03_disable_BF16"    = "NEON_BF16"
+          "04_disable_DOTPROD" = "NEON_DOTPROD"
+        }
+
+        $results = @{}
+        foreach ($cfg in $configs.Keys) {
+          $env:OPENCV_CPU_DISABLE = $configs[$cfg]
+          Write-Host "==== CONFIG $cfg   OPENCV_CPU_DISABLE='$($configs[$cfg])' ===="
+          foreach ($m in $modules) {
+            $env:OPENCV_TEST_SEED = $m.seed
+            $log = "ab_logs/${cfg}_$($m.name).log"
+            if (Test-Path $m.exe) {
+              & $m.exe --skip_unstable=1 --gtest_filter="$($m.filter)" *> $log
+              $fL = Select-String $log -Pattern "^\[  FAILED  \] (\d+) test" | Select-Object -First 1
+              $pL = Select-String $log -Pattern "^\[  PASSED  \] (\d+) test" | Select-Object -First 1
+              $f = if ($fL) { [int]$fL.Matches[0].Groups[1].Value } else { 0 }
+              $p = if ($pL) { [int]$pL.Matches[0].Groups[1].Value } else { 0 }
+              $results["$($m.name)|$cfg"] = "$p/$f"
+            } else {
+              $results["$($m.name)|$cfg"] = "NOEXE"
+            }
+            Write-Host ("  {0,-10} -> {1}" -f $m.name, $results["$($m.name)|$cfg"])
+          }
+        }
+
+        $rows = @()
+        foreach ($m in $modules) {
+          $r = [ordered]@{ Module = $m.name }
+          foreach ($c in $configs.Keys) { $r[$c] = $results["$($m.name)|$c"] }
+          $rows += [pscustomobject]$r
+        }
+        Write-Host ""
+        Write-Host "################  SUMMARY (cell = passed/failed)  ################"
+        $rows | Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Host
+        Write-Host "Baseline (00) should show failures. The config that drops a module's"
+        Write-Host "'failed' to 0 identifies the broken dispatched kernel for that module."
+
+    - name: Upload A/B logs (ARM64, TEMPORARY)
+      if: ${{ always() && matrix.arch == 'arm64' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: simd-ab-logs
+        path: ab_logs/
+
     - if: ${{ always() && env.WARNINGS == '1' }}
       name: Warnings check
       run: |
