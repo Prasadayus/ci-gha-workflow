@@ -132,6 +132,30 @@ jobs:
       shell: bash
       run: echo "PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -i '/mingw' | paste -sd ':')" >> "$GITHUB_ENV"
 
+    # TEMPORARY (diagnostic, REVERT before merge). A few tests spin up their own
+    # threads via cv::setNumThreads(<var>), so OPENCV_FOR_THREADS_NUM=1 alone does NOT
+    # serialize them. Force those internal overrides to 1 so the ENTIRE suite runs
+    # single-threaded. NOTE: this neuters the multithread-consistency tests
+    # (they then compare 1-thread vs 1-thread) — it is a diagnostic to confirm
+    # "single-threaded => all green", NOT a fix.
+    - name: (TEMP) Single-thread tests that override the thread count
+      if: ${{ matrix.arch == 'arm64' }}
+      shell: bash
+      run: |
+        base="${{ github.workspace }}/opencv/modules"
+        sed -i 's/setNumThreads(n)/setNumThreads(1)/g'           "$base/imgproc/test/test_contours_truco.cpp"
+        sed -i 's/setNumThreads(n)/setNumThreads(1)/g; s/setNumThreads(num_threads)/setNumThreads(1)/g' "$base/imgproc/test/test_filter.cpp"
+        sed -i 's/setNumThreads(num_threads)/setNumThreads(1)/g' "$base/objdetect/test/test_arucodetection.cpp"
+        sed -i 's/setNumThreads(threads)/setNumThreads(1)/g'     "$base/geometry/test/test_solvepnp_ransac.cpp"
+        sed -i 's/setNumThreads(nThreads)/setNumThreads(1)/g'    "$base/video/test/test_OF_reproducibility.cpp"
+        echo "==== setNumThreads after patch ===="
+        grep -rn "setNumThreads" \
+          "$base/imgproc/test/test_contours_truco.cpp" \
+          "$base/imgproc/test/test_filter.cpp" \
+          "$base/objdetect/test/test_arucodetection.cpp" \
+          "$base/geometry/test/test_solvepnp_ransac.cpp" \
+          "$base/video/test/test_OF_reproducibility.cpp"
+
     - if: ${{ github.event.repository.name != 'opencv_contrib' }}
       name: Configure and build OpenCV
       uses: ./configure-and-build
@@ -157,6 +181,7 @@ jobs:
         OPENCV_TEST_CHECK_OPTIONAL_DATA: ${{ matrix.arch == 'arm64' && '0' || '1' }}
         PYTHONPATH: '${{ github.workspace }}/${{ env.MAIN_BUILD_DIR }}/python_loader:$PYTHONPATH'
         OPENCV_OPENCL_RUNTIME: 'disabled'
+        OPENCV_FOR_THREADS_NUM: '1'   # TEMP: run the whole arm64 suite single-threaded (revert before merge)
       with:
         workdir: '${{ github.workspace }}'
         builddir: '${{ env.MAIN_BUILD_DIR }}'
@@ -168,86 +193,6 @@ jobs:
         filter: "[ 'windows-common' ]"
         suffix: '${{ matrix.arch }}_${{ matrix.branch }}'
         timeout: 15
-
-    # ============================================================
-    # TEMPORARY diagnostic — REVERT before the upstream PR.
-    # Re-runs the known-failing tests against the ALREADY-BUILT binaries at
-    # different thread counts to classify the failures:
-    #   mt4 = 4 threads (control, reproduces CI)
-    #   st1 = 1 thread, run #1
-    #   st2 = 1 thread, run #2  (st1 vs st2 = determinism check at 1 thread)
-    # Reading the SUMMARY (cell = passed/failed):
-    #   * module green at st1 AND st2 but red at mt4  -> multithreading race
-    #   * st1 == st2 red (same counts)                -> deterministic single-thread bug
-    #   * st1 != st2                                   -> non-deterministic even single-threaded
-    #                                                     (uninitialized/OOB memory, not a pure race)
-    # ============================================================
-    - name: Thread-count diagnostic (ARM64, TEMPORARY)
-      if: ${{ always() && matrix.arch == 'arm64' }}
-      shell: pwsh
-      working-directory: '${{ github.workspace }}'
-      run: |
-        $env:OPENCV_TEST_DATA_PATH           = "${{ github.workspace }}/opencv_extra/testdata"
-        $env:OPENCV_TEST_REQUIRE_DATA        = "0"
-        $env:OPENCV_TEST_CHECK_OPTIONAL_DATA = "0"
-        $env:OPENCV_CPU_DISABLE              = ""
-        $bin = "build/bin/Release"
-        New-Item -ItemType Directory -Force thread_logs | Out-Null
-
-        $imgSeed = "0x00000000000c5aca"; $coreSeed = "0x00000000000c5a61"
-        $modules = @(
-          @{ name="imgproc";   exe="$bin/opencv_test_imgproc.exe";   seed=$imgSeed;  filter="*ColorYUV*:Imgproc_Remap.accuracy:*FindTRUContours*:*RemapRelative*:*MatchTemplateWithMask*:*Equalize_Hist*" }
-          @{ name="core";      exe="$bin/opencv_test_core.exe";      seed=$coreSeed; filter="Core_Reduce.accuracy" }
-          @{ name="objdetect"; exe="$bin/opencv_test_objdetect.exe"; seed=$imgSeed;  filter="CV_*Aruco*:CV_*Charuco*:CV_*April*:Objdetect_QRCode_Encode_Decode.regression" }
-          @{ name="ptcloud";   exe="$bin/opencv_test_ptcloud.exe";   seed=$imgSeed;  filter="*VolumeTestFixture.fetch_normals*" }
-          @{ name="geometry";  exe="$bin/opencv_test_geometry.exe";  seed=$imgSeed;  filter="Calib3d_InitUndistortMap.accuracy:Calib3d_UndistortImgproc.accuracy" }
-          @{ name="video";     exe="$bin/opencv_test_video.exe";     seed=$imgSeed;  filter="*Video_ECC.accuracy*" }
-          @{ name="stitching"; exe="$bin/opencv_test_stitching.exe"; seed=$imgSeed;  filter="ImageStitcher.setTransform" }
-          @{ name="dnn";       exe="$bin/opencv_test_dnn.exe";       seed=$imgSeed;  filter="*TESTKVCache.layouts*" }
-        )
-        # label -> thread count
-        $modes = [ordered]@{ "mt4" = "4"; "st1" = "1"; "st2" = "1" }
-
-        $results = @{}
-        foreach ($mode in $modes.Keys) {
-          $env:OPENCV_FOR_THREADS_NUM = $modes[$mode]
-          Write-Host "==== MODE $mode   OPENCV_FOR_THREADS_NUM=$($modes[$mode]) ===="
-          foreach ($m in $modules) {
-            $env:OPENCV_TEST_SEED = $m.seed
-            $log = "thread_logs/${mode}_$($m.name).log"
-            if (Test-Path $m.exe) {
-              & $m.exe --skip_unstable=1 --gtest_filter="$($m.filter)" *> $log
-              $fL = Select-String $log -Pattern "^\[  FAILED  \] (\d+) test" | Select-Object -First 1
-              $pL = Select-String $log -Pattern "^\[  PASSED  \] (\d+) test" | Select-Object -First 1
-              $f = if ($fL) { [int]$fL.Matches[0].Groups[1].Value } else { 0 }
-              $p = if ($pL) { [int]$pL.Matches[0].Groups[1].Value } else { 0 }
-              $results["$($m.name)|$mode"] = "$p/$f"
-            } else {
-              $results["$($m.name)|$mode"] = "NOEXE"
-            }
-            Write-Host ("  {0,-10} -> {1}" -f $m.name, $results["$($m.name)|$mode"])
-          }
-        }
-
-        $rows = @()
-        foreach ($m in $modules) {
-          $r = [ordered]@{ Module = $m.name }
-          foreach ($mode in $modes.Keys) { $r[$mode] = $results["$($m.name)|$mode"] }
-          $rows += [pscustomobject]$r
-        }
-        Write-Host ""
-        Write-Host "################  SUMMARY (cell = passed/failed)  ################"
-        $rows | Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Host
-        Write-Host "mt4=control(4 threads), st1/st2=single-threaded runs."
-        Write-Host "green at st1 AND st2 but red at mt4 -> threading race."
-        Write-Host "st1==st2 red -> deterministic single-thread bug. st1!=st2 -> uninitialized/OOB memory."
-
-    - name: Upload thread-diagnostic logs (ARM64, TEMPORARY)
-      if: ${{ always() && matrix.arch == 'arm64' }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: thread-diag-logs
-        path: thread_logs/
 
     - if: ${{ always() && env.WARNINGS == '1' }}
       name: Warnings check
