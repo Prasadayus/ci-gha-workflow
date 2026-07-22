@@ -181,7 +181,7 @@ jobs:
         OPENCV_TEST_CHECK_OPTIONAL_DATA: ${{ matrix.arch == 'arm64' && '0' || '1' }}
         PYTHONPATH: '${{ github.workspace }}/${{ env.MAIN_BUILD_DIR }}/python_loader:$PYTHONPATH'
         OPENCV_OPENCL_RUNTIME: 'disabled'
-        OPENCV_FOR_THREADS_NUM: '1'   # TEMP: run the whole arm64 suite single-threaded (revert before merge)
+        OPENCV_FOR_THREADS_NUM: '2'   # TEMP: does the bug trigger at 2 threads (main + 1 worker)? (revert before merge)
       with:
         workdir: '${{ github.workspace }}'
         builddir: '${{ env.MAIN_BUILD_DIR }}'
