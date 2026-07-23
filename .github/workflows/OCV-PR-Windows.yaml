@@ -65,6 +65,13 @@ jobs:
       run:
         shell: bash
     env:
+      # Windows-ARM64 default parallel backend (ms-concurrency/PPL) has a latent,
+      # timing-dependent data race that only manifests on the windows-11-arm runner
+      # (~13-51 test failures across 8 modules, non-deterministic, scales with thread
+      # count; absent on Linux-ARM64/macOS-ARM64/local Windows-ARM64 hardware). Switching
+      # to OpenMP avoids it: OpenCV's parallel.cpp backend-selection #elif chain picks
+      # OpenMP over ms-concurrency whenever OpenMP is enabled, no other change needed.
+      # See opencv/opencv issue <TBD> for the full investigation.
       CMAKE_OPT: >-
         -DCL_Z_OPTION=/Z7
         -DBUILD_EXAMPLES=ON
@@ -72,6 +79,7 @@ jobs:
         -DCMAKE_BUILD_TYPE=Release
         ${{ matrix.no_opencl && '-DWITH_OPENCL=OFF' || '' }}
         ${{ matrix.arch == 'x86' && '-DBUILD_opencv_python3=OFF' || '' }}
+        ${{ matrix.arch == 'arm64' && '-DWITH_OPENMP=ON' || '' }}
       MAIN_BUILD_DIR: "${{ (github.event.repository.name != 'opencv_contrib') && 'build' || 'build-contrib' }}"
       OPENCV_FOR_THREADS_NUM: 8
       CMAKE_BUILD_PARALLEL_LEVEL: 8
@@ -127,6 +135,23 @@ jobs:
           --dst '${{ env.DNN_MODELS }}/dnn'
         echo "OPENCV_DNN_TEST_DATA_PATH=${{ env.DNN_MODELS }}" >> $GITHUB_ENV
 
+    # The windows-11-arm runner has C:\mingw64\bin on PATH. OpenCV enables the ASM
+    # language, CMake searches PATH for an assembler, finds mingw's cc.exe, IDs it as
+    # GNU, and sets MINGW=true even though C/C++ actually compile with MSVC. That flips
+    # the link line to GNU-style flags (-ld3d11, -lgdi32, ...) which MSVC's linker
+    # silently ignores, breaking the DirectX interop samples (LNK2019/LNK1120).
+    - name: Remove MinGW from PATH (ARM64 MSVC build)
+      if: ${{ matrix.arch == 'arm64' }}
+      shell: bash
+      run: echo "PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -i '/mingw' | paste -sd ':')" >> "$GITHUB_ENV"
+
+    # Runner HW identity for this job, for reference when investigating ARM64-specific
+    # behavior (this runner's failures did not reproduce on other ARM64 platforms/hardware).
+    - name: Print runner CPU model (ARM64)
+      if: ${{ matrix.arch == 'arm64' }}
+      shell: pwsh
+      run: Get-CimInstance Win32_Processor | Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors | Format-List
+
     - if: ${{ github.event.repository.name != 'opencv_contrib' }}
       name: Configure and build OpenCV
       uses: ./configure-and-build
@@ -135,6 +160,21 @@ jobs:
         builddir: 'build'
         generator: '${{ matrix.vs }}'
         options: '-A ${{ matrix.cmake_arch }} ${{ env.CMAKE_OPT }}'
+
+    # Guard against silently regressing back to ms-concurrency (e.g. if a future runner
+    # image drops OpenMP support): every opencv_test_* binary prints "Parallel framework: "
+    # unconditionally at startup (modules/ts/src/ts.cpp), so a trivial no-test invocation
+    # is enough to check it without waiting for the full suite.
+    - name: Verify ARM64 parallel backend is OpenMP
+      if: ${{ github.event.repository.name != 'opencv_contrib' && matrix.arch == 'arm64' }}
+      working-directory: '${{ github.workspace }}'
+      shell: bash
+      run: |
+        ./build/bin/Release/opencv_test_core.exe --gtest_filter='-*' 2>&1 | tee parallel_backend.log
+        if ! grep -q "Parallel framework: openmp" parallel_backend.log; then
+          echo "::error::ARM64 build did not select the OpenMP parallel backend (expected from -DWITH_OPENMP=ON). This job depends on OpenMP to avoid a known ms-concurrency (PPL) race on Windows-ARM64 -- see opencv/opencv issue <TBD>."
+          exit 1
+        fi
 
     - name: Configure and build OpenCV with contrib
       uses: ./configure-and-build
