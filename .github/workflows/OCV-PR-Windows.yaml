@@ -34,11 +34,9 @@ jobs:
         - id: determine-branches
           shell: bash
           run: |
-            if [ "${{ github.event.repository.name == 'ci-gha-workflow' }}" = "true" ] ; then
-              echo "branches=[ '4.x', '5.x' ]" >> "$GITHUB_OUTPUT"
-            else
-              echo "branches=[ '${{ github.base_ref }}' ]" >> "$GITHUB_OUTPUT"
-            fi
+            # TEMP (diagnostic, REVERT before merge): restrict to 5.x only for
+            # the core-latency probe experiment, to keep CI turnaround fast.
+            echo "branches=[ '5.x' ]" >> "$GITHUB_OUTPUT"
 
   Windows:
     runs-on: ${{ matrix.runner }}
@@ -64,13 +62,16 @@ jobs:
     defaults:
       run:
         shell: bash
+    # TEMP (diagnostic, REVERT before merge): -DWITH_OPENMP=ON removed from
+    # CMAKE_OPT below so this build uses the DEFAULT parallel backend
+    # (ms-concurrency/PPL), to check the core-latency probe's numbers against
+    # the default build rather than only the already-fixed OpenMP build.
     env:
       CMAKE_OPT: >-
         -DCL_Z_OPTION=/Z7
         -DBUILD_EXAMPLES=ON
         -DOPENCV_ENABLE_NONFREE=ON
         -DCMAKE_BUILD_TYPE=Release
-        ${{ matrix.arch == 'arm64' && '-DWITH_OPENMP=ON' || '' }}
         ${{ matrix.arch == 'arm64' && '-DCMAKE_ASM_COMPILER=CMAKE_ASM_COMPILER-NOTFOUND' || '' }}
         ${{ matrix.no_opencl && '-DWITH_OPENCL=OFF' || '' }}
         ${{ matrix.arch == 'x86' && '-DBUILD_opencv_python3=OFF' || '' }}
@@ -129,6 +130,83 @@ jobs:
           --dst '${{ env.DNN_MODELS }}/dnn'
         echo "OPENCV_DNN_TEST_DATA_PATH=${{ env.DNN_MODELS }}" >> $GITHUB_ENV
 
+    # TEMP (diagnostic, REVERT before merge): inject a core-to-core cache-line
+    # ping-pong probe into core/test (auto-globbed into opencv_test_core), to
+    # directly measure cross-core write-visibility latency on this runner in
+    # nanoseconds, for every pair of logical processors. See CI273.md for why:
+    # comparing this runner's real numbers against Oryon's published/measured
+    # cluster-vs-cross-cluster latency figures, using the identical benchmark
+    # code on both machines, closes the gap of comparing two different tools.
+    - name: (TEMP) Add core-to-core latency probe test
+      if: ${{ matrix.arch == 'arm64' }}
+      shell: bash
+      working-directory: '${{ github.workspace }}'
+      run: |
+        cat > opencv/modules/core/test/test_core_latency_probe.cpp <<'EOF'
+        #include "test_precomp.hpp"
+        #if defined(_WIN32)
+        #include <windows.h>
+        #include <atomic>
+        #include <chrono>
+        #include <thread>
+
+        namespace opencv_test { namespace {
+
+        struct alignas(64) PingPongSlot
+        {
+            std::atomic<uint64_t> value{0};
+            char pad[64 - sizeof(std::atomic<uint64_t>)];
+        };
+
+        static void measurePairLatencyNs(int cpuA, int cpuB, int rounds)
+        {
+            PingPongSlot a, b;
+            std::atomic<bool> readyB{false};
+
+            std::thread tB([&]() {
+                SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpuB);
+                readyB = true;
+                for (int i = 1; i <= rounds; ++i)
+                {
+                    while (a.value.load(std::memory_order_acquire) != (uint64_t)i) {}
+                    b.value.store((uint64_t)i, std::memory_order_release);
+                }
+            });
+            std::thread tA([&]() {
+                SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpuA);
+                while (!readyB) {}
+                auto t0 = std::chrono::high_resolution_clock::now();
+                for (int i = 1; i <= rounds; ++i)
+                {
+                    a.value.store((uint64_t)i, std::memory_order_release);
+                    while (b.value.load(std::memory_order_acquire) != (uint64_t)i) {}
+                }
+                auto t1 = std::chrono::high_resolution_clock::now();
+                double totalNs = std::chrono::duration<double, std::nano>(t1 - t0).count();
+                printf("PAIR cpu%d-cpu%d one_way_ns=%.1f\n", cpuA, cpuB, totalNs / (2.0 * rounds));
+            });
+            tA.join();
+            tB.join();
+        }
+
+        TEST(CoreLatencyProbe, all_pairs)
+        {
+            SYSTEM_INFO si;
+            GetSystemInfo(&si);
+            int n = (int)si.dwNumberOfProcessors;
+            printf("=== CORE LATENCY PROBE: logical_processors=%d ===\n", n);
+            const int rounds = 200000;
+            for (int i = 0; i < n; ++i)
+                for (int j = i + 1; j < n; ++j)
+                    measurePairLatencyNs(i, j, rounds);
+            printf("=== END CORE LATENCY PROBE ===\n");
+        }
+
+        }} // namespace
+        #endif // _WIN32
+        EOF
+        echo "wrote probe:"; ls -l opencv/modules/core/test/test_core_latency_probe.cpp
+
     - if: ${{ github.event.repository.name != 'opencv_contrib' }}
       name: Configure and build OpenCV
       uses: ./configure-and-build
@@ -138,13 +216,24 @@ jobs:
         generator: '${{ matrix.vs }}'
         options: '-A ${{ matrix.cmake_arch }} ${{ env.CMAKE_OPT }}'
 
-    - name: Configure and build OpenCV with contrib
+    # TEMP (diagnostic, REVERT before merge): skip the contrib build for
+    # faster iteration on the core-latency probe experiment.
+    - if: false
+      name: Configure and build OpenCV with contrib
       uses: ./configure-and-build
       with:
         workdir: '${{ github.workspace }}'
         builddir: 'build-contrib'
         generator: '${{ matrix.vs }}'
         options: '-A ${{ matrix.cmake_arch }} -DCMAKE_BUILD_TYPE=Release -DOPENCV_EXTRA_MODULES_PATH=opencv_contrib/modules ${{ env.CMAKE_OPT }}'
+
+    # TEMP (diagnostic, REVERT before merge): run only the probe, filtered so
+    # it does not also run the rest of opencv_test_core's own test cases.
+    - name: (TEMP) Run core-to-core latency probe
+      if: ${{ always() && matrix.arch == 'arm64' }}
+      working-directory: '${{ github.workspace }}'
+      shell: bash
+      run: ./build/bin/Release/opencv_test_core.exe --gtest_filter='CoreLatencyProbe.*'
 
     - name: Run OpenCV tests
       uses: ./run-tests
