@@ -130,6 +130,19 @@ jobs:
           --dst '${{ env.DNN_MODELS }}/dnn'
         echo "OPENCV_DNN_TEST_DATA_PATH=${{ env.DNN_MODELS }}" >> $GITHUB_ENV
 
+    # TEMP (diagnostic, REVERT before merge): cherry-pick SavyaSanchi-Sharma's
+    # pplScheduler mutex fix (opencv#issue/ppl branch, commit 5104fe7) onto
+    # stock 5.x, to test whether it eliminates the multithreading failures
+    # under the default PPL backend. Only this one commit, not the full
+    # 14-commit branch, since the rest hasn't been reviewed.
+    - name: (TEMP) Cherry-pick pplScheduler mutex fix
+      if: ${{ matrix.arch == 'arm64' }}
+      working-directory: '${{ github.workspace }}/opencv'
+      shell: bash
+      run: |
+        git fetch https://github.com/SavyaSanchi-Sharma/opencv.git 5104fe77f6130c6b4705c6a748251fa8a890a762
+        git cherry-pick FETCH_HEAD
+
     # TEMP (diagnostic, REVERT before merge): inject a core-to-core cache-line
     # ping-pong probe into core/test (auto-globbed into opencv_test_core), to
     # directly measure cross-core write-visibility latency on this runner in
