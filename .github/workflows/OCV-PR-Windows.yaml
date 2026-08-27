@@ -131,13 +131,23 @@ jobs:
     # cherry-pick step did. Prasadayus/opencv#64: contours_truco.cpp
     # connected-components redesign + pencil-sketch stale-variable fix +
     # initInterTab2D std::call_once fix, all currently on 4.x.
-    - name: (TEMP) Pull in confirmed fixes from opencv fork
+    #
+    # Checked out directly (detached HEAD at this exact SHA) rather than
+    # merged -- a merge creates a new, unpredictable commit hash each run,
+    # which makes it hard to verify after the fact exactly what tree state
+    # got built (CMake's "Version control:" line in the configure log won't
+    # obviously match a merge commit's hash). Checking out the fork commit
+    # directly means that line is directly traceable to a known, specific
+    # SHA -- no ambiguity about what was actually tested.
+    - name: (TEMP) Pin to confirmed fixes commit from opencv fork
       if: ${{ matrix.arch == 'arm64' }}
       working-directory: '${{ github.workspace }}/opencv'
       shell: bash
       run: |
         git fetch https://github.com/Prasadayus/opencv.git c301419e35b2419067a2ff2677945dbd153581ef
-        git merge --no-edit FETCH_HEAD
+        git checkout FETCH_HEAD
+        echo "Checked out commit: $(git rev-parse HEAD)"
+        git log -1 --stat
 
     - name: Update extra dnn models
       if: ${{ matrix.arch != 'arm64' }}
