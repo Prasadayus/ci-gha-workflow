@@ -139,12 +139,19 @@ jobs:
     # obviously match a merge commit's hash). Checking out the fork commit
     # directly means that line is directly traceable to a known, specific
     # SHA -- no ambiguity about what was actually tested.
-    - name: (TEMP) Pin to confirmed fixes commit from opencv fork
+    - name: (TEMP) Pin to diagnostics commit from opencv fork
       if: ${{ matrix.arch == 'arm64' }}
       working-directory: '${{ github.workspace }}/opencv'
       shell: bash
       run: |
-        git fetch https://github.com/Prasadayus/opencv.git c301419e35b2419067a2ff2677945dbd153581ef
+        # f3caf9e9d1 = c301419e35 (the three fixes: contours_truco.cpp
+        # connected-components redesign, npr.hpp stale-temp fix, imgwarp.cpp
+        # call_once) PLUS the OpenCV-vs-PPL diagnostics run by the steps at the
+        # end of this job: ppl_contract_audit.cpp,
+        # modules/imgproc/test/test_parallel_backend_ab.cpp, and a DISABLED_
+        # ColorYUV size sweep in test_cvtyuv.cpp (inert -- nothing invokes it).
+        # Expect CMake's "Version control:" line to read 4.14.0-<n>-gf3caf9e9d1.
+        git fetch https://github.com/Prasadayus/opencv.git f3caf9e9d1e111ed8ce0bd1a00bdfb3ca9fa8dad
         git checkout FETCH_HEAD
         echo "Checked out commit: $(git rev-parse HEAD)"
         git log -1 --stat
@@ -159,148 +166,6 @@ jobs:
           --dst '${{ env.DNN_MODELS }}/dnn'
         echo "OPENCV_DNN_TEST_DATA_PATH=${{ env.DNN_MODELS }}" >> $GITHUB_ENV
 
-    # TEMP (diagnostic, REVERT before merge): inject a plain, minimal probe
-    # isolating one specific question -- does Concurrency::parallel_for's
-    # spawn/join relationship reliably make a value written by the calling
-    # thread immediately before dispatch visible to every worker lambda, with
-    # zero explicit synchronization on our part? This is a direct analog of
-    # modules/core/src/parallel.cpp:214 (the write) and :340 (the read),
-    # stripped down to nothing else -- if it races here, on this exact CI
-    # hardware, the gap is in PPL/ConcRT's runtime itself, not in anything
-    # OpenCV's parallel.cpp does. Ran clean (0 stale / 200,000,000 reads) on a
-    # local Snapdragon X (Oryon) machine; this runner is different silicon
-    # (the Cobalt 100/Neoverse-class chip the original Core_Rand failure was
-    # actually observed on), so that result doesn't settle the question here.
-    - name: (TEMP) Add ctx-handoff probe test
-      if: ${{ matrix.arch == 'arm64' }}
-      shell: bash
-      working-directory: '${{ github.workspace }}'
-      run: |
-        cat > opencv/modules/core/test/test_ctx_handoff_probe.cpp <<'EOF'
-        #include "test_precomp.hpp"
-        #if defined(_WIN32) && defined(_MSC_VER) && _MSC_VER >= 1600
-        #include <ppl.h>
-        #include <atomic>
-
-        namespace opencv_test { namespace {
-
-        TEST(CtxHandoffProbe, repeated_trials)
-        {
-            const int NUM_ROWS = 1000;
-            const long long NUM_TRIALS = 50000;
-            long long ctxValue = -1;
-            std::atomic<long long> totalReads{0};
-            std::atomic<long long> staleReads{0};
-            long long firstStaleTrial = -1;
-            long long firstStaleObserved = -1;
-
-            printf("=== CTX HANDOFF PROBE: starting %lld trials x %d workers ===\n", NUM_TRIALS, NUM_ROWS);
-
-            for (long long trial = 0; trial < NUM_TRIALS; ++trial)
-            {
-                ctxValue = trial;
-                Concurrency::parallel_for(0, NUM_ROWS, [&](int) {
-                    long long observed = ctxValue;
-                    totalReads.fetch_add(1, std::memory_order_relaxed);
-                    if (observed != trial)
-                    {
-                        long long prevStale = staleReads.fetch_add(1, std::memory_order_relaxed);
-                        if (prevStale == 0) { firstStaleTrial = trial; firstStaleObserved = observed; }
-                    }
-                });
-            }
-
-            long long total = totalReads.load();
-            long long stale = staleReads.load();
-            printf("=== CTX HANDOFF PROBE RESULT: total=%lld stale=%lld pct=%.6f ===\n",
-                   total, stale, total ? 100.0 * (double)stale / (double)total : 0.0);
-            if (stale > 0)
-                printf("=== CTX HANDOFF PROBE FIRST STALE: trial=%lld observed=%lld ===\n",
-                       firstStaleTrial, firstStaleObserved);
-        }
-
-        }} // namespace
-        #endif // _WIN32 && _MSC_VER
-        EOF
-        echo "wrote probe:"; ls -l opencv/modules/core/test/test_ctx_handoff_probe.cpp
-
-    # TEMP (diagnostic, REVERT before merge): inject a core-to-core cache-line
-    # ping-pong probe into core/test (auto-globbed into opencv_test_core), to
-    # directly measure cross-core write-visibility latency on this runner in
-    # nanoseconds, for every pair of logical processors. See CI273.md for why:
-    # comparing this runner's real numbers against Oryon's published/measured
-    # cluster-vs-cross-cluster latency figures, using the identical benchmark
-    # code on both machines, closes the gap of comparing two different tools.
-    - name: (TEMP) Add core-to-core latency probe test
-      if: ${{ matrix.arch == 'arm64' }}
-      shell: bash
-      working-directory: '${{ github.workspace }}'
-      run: |
-        cat > opencv/modules/core/test/test_core_latency_probe.cpp <<'EOF'
-        #include "test_precomp.hpp"
-        #if defined(_WIN32)
-        #include <windows.h>
-        #include <atomic>
-        #include <chrono>
-        #include <thread>
-
-        namespace opencv_test { namespace {
-
-        struct alignas(64) PingPongSlot
-        {
-            std::atomic<uint64_t> value{0};
-            char pad[64 - sizeof(std::atomic<uint64_t>)];
-        };
-
-        static void measurePairLatencyNs(int cpuA, int cpuB, int rounds)
-        {
-            PingPongSlot a, b;
-            std::atomic<bool> readyB{false};
-
-            std::thread tB([&]() {
-                SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpuB);
-                readyB = true;
-                for (int i = 1; i <= rounds; ++i)
-                {
-                    while (a.value.load(std::memory_order_acquire) != (uint64_t)i) {}
-                    b.value.store((uint64_t)i, std::memory_order_release);
-                }
-            });
-            std::thread tA([&]() {
-                SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << cpuA);
-                while (!readyB) {}
-                auto t0 = std::chrono::high_resolution_clock::now();
-                for (int i = 1; i <= rounds; ++i)
-                {
-                    a.value.store((uint64_t)i, std::memory_order_release);
-                    while (b.value.load(std::memory_order_acquire) != (uint64_t)i) {}
-                }
-                auto t1 = std::chrono::high_resolution_clock::now();
-                double totalNs = std::chrono::duration<double, std::nano>(t1 - t0).count();
-                printf("PAIR cpu%d-cpu%d one_way_ns=%.1f\n", cpuA, cpuB, totalNs / (2.0 * rounds));
-            });
-            tA.join();
-            tB.join();
-        }
-
-        TEST(CoreLatencyProbe, all_pairs)
-        {
-            SYSTEM_INFO si;
-            GetSystemInfo(&si);
-            int n = (int)si.dwNumberOfProcessors;
-            printf("=== CORE LATENCY PROBE: logical_processors=%d ===\n", n);
-            const int rounds = 200000;
-            for (int i = 0; i < n; ++i)
-                for (int j = i + 1; j < n; ++j)
-                    measurePairLatencyNs(i, j, rounds);
-            printf("=== END CORE LATENCY PROBE ===\n");
-        }
-
-        }} // namespace
-        #endif // _WIN32
-        EOF
-        echo "wrote probe:"; ls -l opencv/modules/core/test/test_core_latency_probe.cpp
-
     - if: ${{ github.event.repository.name != 'opencv_contrib' }}
       name: Configure and build OpenCV
       uses: ./configure-and-build
@@ -310,8 +175,9 @@ jobs:
         generator: '${{ matrix.vs }}'
         options: '-A ${{ matrix.cmake_arch }} ${{ env.CMAKE_OPT }}'
 
-    # TEMP (diagnostic, REVERT before merge): skip the contrib build for
-    # faster iteration on the core-latency probe experiment.
+    # TEMP (diagnostic, REVERT before merge): skip the contrib build for faster
+    # iteration on the OpenCV-vs-PPL diagnostics further down. None of them
+    # touch contrib modules, so building it only costs wall-clock time.
     - if: false
       name: Configure and build OpenCV with contrib
       uses: ./configure-and-build
@@ -321,34 +187,115 @@ jobs:
         generator: '${{ matrix.vs }}'
         options: '-A ${{ matrix.cmake_arch }} -DCMAKE_BUILD_TYPE=Release -DOPENCV_EXTRA_MODULES_PATH=opencv_contrib/modules ${{ env.CMAKE_OPT }}'
 
-    # TEMP (diagnostic, REVERT before merge): run only the probe, filtered so
-    # it does not also run the rest of opencv_test_core's own test cases.
-    - name: (TEMP) Run core-to-core latency probe
-      if: ${{ always() && matrix.arch == 'arm64' }}
-      working-directory: '${{ github.workspace }}'
-      shell: bash
-      run: ./build/bin/Release/opencv_test_core.exe --gtest_filter='CoreLatencyProbe.*'
-
-    # TEMP (diagnostic, REVERT before merge): run the standalone ctx-handoff
-    # probe injected above, on the actual CI hardware this whole question is
-    # about.
-    - name: (TEMP) Run ctx-handoff probe
-      if: ${{ always() && matrix.arch == 'arm64' }}
-      working-directory: '${{ github.workspace }}'
-      shell: bash
-      run: ./build/bin/Release/opencv_test_core.exe --gtest_filter='CtxHandoffProbe.*'
-
     # TEMP (diagnostic, REVERT before merge): the real, unmodified OpenCV test
-    # this whole investigation started from -- repeated 2000x in one process,
-    # closer to the actual conditions (real-sized context object, OpenCV's
-    # full layered dispatch, not a stripped-down analog) than the probe above.
-    # Never confirmed locally on Snapdragon/Oryon either -- every prior
-    # failure came only from official CI on this runner's hardware.
+    # this whole investigation started from -- repeated 2000x in one process.
+    # Kept as a control: it exercises OpenCV's full layered dispatch with a
+    # real-sized context object, and it failed once on Alexander's official 4.x
+    # CI run, which has never been explained. It has since come back clean here
+    # (0/2000) and clean on a local Snapdragon, so it is a regression watch
+    # rather than an open lead. Drop it if CI wall-clock becomes a problem.
     - name: (TEMP) Run Core_Rand.parallel_for_stable_results repeated
       if: ${{ always() && matrix.arch == 'arm64' }}
       working-directory: '${{ github.workspace }}'
       shell: bash
       run: ./build/bin/Release/opencv_test_core.exe --gtest_filter='Core_Rand.parallel_for_stable_results' --gtest_repeat=2000
+
+    # =========================================================================
+    # TEMP (diagnostic, REVERT before merge): the three steps below are the
+    # decisive experiment for "is this OpenCV's bug or PPL's?".
+    #
+    # Everything below has already been run on the developer's Snapdragon X
+    # (Oryon) machine, pinned to 4 CPUs to match this runner's vCPU count, and
+    # came back completely clean:
+    #   - the real FindTRUContours tests, 400 executions  -> 0 failures
+    #   - the A/B backend swap, 760 comparisons/backend    -> 0 divergence
+    #   - stripe delivery, ~10M stripes                    -> all correct
+    #   - the standalone PPL contract audit, ~30M dispatches -> all 4 guarantees held
+    # And the input images are provably identical to CI's, because
+    # modules/ts/src/ts.cpp:790 (testSetUp) resets theRNG to a fixed
+    # cvtest::param_seed before every single test.
+    #
+    # So core count, input images, test parameters, thread counts and PPL's
+    # task-delivery contract are all eliminated as explanations. The one
+    # remaining difference is the SILICON: Cobalt 100 / Neoverse N2 here versus
+    # Oryon there. Every PPL test so far ran on Oryon; PPL-on-Cobalt has never
+    # been tested. These steps test it.
+    #
+    # HOW TO READ THE RESULTS:
+    #   Contract audit FAILS here  -> PPL breaks its documented contract on this
+    #                                 silicon and not on Oryon. No OpenCV is
+    #                                 linked into that binary, so this is PROOF
+    #                                 the defect is PPL's, not OpenCV's.
+    #   Contract audit PASSES here -> PPL's guarantees hold on Cobalt too, yet
+    #                                 the OpenCV tests still fail => the
+    #                                 divergence comes from OpenCV's own memory
+    #                                 access being exposed by Neoverse N2's
+    #                                 ordering => OpenCV's defect. Next step
+    #                                 would be a per-pixel write-ownership
+    #                                 detector in contours_truco.cpp.
+    # Either outcome settles the question.
+    # =========================================================================
+
+    # No OpenCV linked at all -- that is the whole point. Audits the four PPL
+    # guarantees OpenCV's parallel_for_ silently relies on: caller->worker
+    # visibility, exactly-once delivery, worker->caller visibility after the
+    # join, and multi-word write integrity. Mirrors OpenCV's own scheduler
+    # policy (parallel.cpp:764), per-call Attach/Detach (parallel.cpp:598-609)
+    # and one-index-per-task dispatch shape (parallel.cpp:447-450).
+    # Exits non-zero on a contract violation, so the step fails loudly.
+    - name: (TEMP) PPL contract audit (no OpenCV linked)
+      if: ${{ always() && matrix.arch == 'arm64' }}
+      working-directory: '${{ github.workspace }}/opencv'
+      shell: cmd
+      run: |
+        rem Locate VS via vswhere rather than hardcoding an edition path. The CI
+        rem log shows the compiler under .../2022/Enterprise/..., but hardcoding
+        rem that makes this step die outright if the runner image ever changes
+        rem edition -- and a dead step teaches us nothing.
+        set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+        if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
+        set "VSPATH="
+        if exist "%VSWHERE%" for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -property installationPath`) do set "VSPATH=%%i"
+        if not defined VSPATH set "VSPATH=C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+        echo Using VS at: %VSPATH%
+        if not exist "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" (
+          echo ERROR: vcvarsall.bat not found under "%VSPATH%"
+          exit /b 1
+        )
+        call "%VSPATH%\VC\Auxiliary\Build\vcvarsall.bat" arm64
+        if errorlevel 1 ( echo ERROR: vcvarsall failed & exit /b 1 )
+        cl /EHsc /O2 /std:c++17 ppl_contract_audit.cpp
+        if errorlevel 1 ( echo ERROR: compile failed & exit /b 1 )
+        ppl_contract_audit.exe
+
+    # In-situ counterpart to the above: goes through OpenCV's real production
+    # cv::parallel_for_ with a body that only records what happened. 997 stripes
+    # (prime, so no chunking divides it evenly) x 2000 trials per thread count.
+    # OpenCV fixes the stripe count BEFORE dispatch, so a skipped or duplicated
+    # stripe cannot be an OpenCV defect -- a failure here is conclusive for PPL
+    # on its own.
+    - name: (TEMP) Stripe delivery audit
+      if: ${{ always() && matrix.arch == 'arm64' }}
+      working-directory: '${{ github.workspace }}'
+      shell: bash
+      run: ./build/bin/Release/opencv_test_imgproc.exe --gtest_also_run_disabled_tests --gtest_filter='*stripe_delivery_audit*'
+
+    # The substitution experiment, run where the failure actually reproduces.
+    # Swaps ONLY the thread pool (a plain std::thread pool, via the public
+    # cv::parallel::setParallelForBackend) while holding the stripe count,
+    # stripe->Range mapping, RNG propagation and exception capture identical --
+    # a custom backend's parallel_for_cb(i, i+1) reaches the very same
+    # ParallelLoopBodyWrapper::operator()(Range(i, i+1)) that PPL's
+    # ProxyLoopBody::operator()(int i) produces.
+    #   Both backends diverge -> OpenCV defect, proven (fails with PPL removed).
+    #   Only the built-in diverges -> strong evidence for the runtime.
+    # Note this reports rather than asserts on the built-in backend, so the step
+    # passing does NOT mean "no problem" -- read the printed verdict block.
+    - name: (TEMP) Backend A/B swap (PPL vs std::thread)
+      if: ${{ always() && matrix.arch == 'arm64' }}
+      working-directory: '${{ github.workspace }}'
+      shell: bash
+      run: ./build/bin/Release/opencv_test_imgproc.exe --gtest_also_run_disabled_tests --gtest_filter='*findContours_ppl_vs_stdthread*'
 
     - name: Run OpenCV tests
       uses: ./run-tests
