@@ -144,14 +144,22 @@ jobs:
       working-directory: '${{ github.workspace }}/opencv'
       shell: bash
       run: |
-        # f3caf9e9d1 = c301419e35 (the three fixes: contours_truco.cpp
+        # b72a1cc689 = c301419e35 (the three fixes: contours_truco.cpp
         # connected-components redesign, npr.hpp stale-temp fix, imgwarp.cpp
         # call_once) PLUS the OpenCV-vs-PPL diagnostics run by the steps at the
         # end of this job: ppl_contract_audit.cpp,
         # modules/imgproc/test/test_parallel_backend_ab.cpp, and a DISABLED_
         # ColorYUV size sweep in test_cvtyuv.cpp (inert -- nothing invokes it).
-        # Expect CMake's "Version control:" line to read 4.14.0-<n>-gf3caf9e9d1.
-        git fetch https://github.com/Prasadayus/opencv.git f3caf9e9d1e111ed8ce0bd1a00bdfb3ca9fa8dad
+        #
+        # b72a1cc689 supersedes f3caf9e9d1: the stripe audit now runs under BOTH
+        # backends and reports proof-of-life counters. The f3caf9e9d1 run found
+        # 27 skipped stripes but had no control, and its printed verdict claimed
+        # "CONCLUSIVE" -- which was wrong, since the standalone contract audit
+        # found raw PPL clean on the same machine. Without the control that
+        # 27-stripe number is unusable, so do not re-run f3caf9e9d1.
+        #
+        # Expect CMake's "Version control:" line to read 4.14.0-<n>-gb72a1cc689.
+        git fetch https://github.com/Prasadayus/opencv.git b72a1cc6897b4abb2cd31644b0768d7dac214095
         git checkout FETCH_HEAD
         echo "Checked out commit: $(git rev-parse HEAD)"
         git log -1 --stat
