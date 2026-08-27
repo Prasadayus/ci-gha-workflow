@@ -144,22 +144,41 @@ jobs:
       working-directory: '${{ github.workspace }}/opencv'
       shell: bash
       run: |
-        # b72a1cc689 = c301419e35 (the three fixes: contours_truco.cpp
+        # 1c08400f4d = c301419e35 (the three fixes: contours_truco.cpp
         # connected-components redesign, npr.hpp stale-temp fix, imgwarp.cpp
         # call_once) PLUS the OpenCV-vs-PPL diagnostics run by the steps at the
         # end of this job: ppl_contract_audit.cpp,
         # modules/imgproc/test/test_parallel_backend_ab.cpp, and a DISABLED_
         # ColorYUV size sweep in test_cvtyuv.cpp (inert -- nothing invokes it).
         #
-        # b72a1cc689 supersedes f3caf9e9d1: the stripe audit now runs under BOTH
-        # backends and reports proof-of-life counters. The f3caf9e9d1 run found
-        # 27 skipped stripes but had no control, and its printed verdict claimed
-        # "CONCLUSIVE" -- which was wrong, since the standalone contract audit
-        # found raw PPL clean on the same machine. Without the control that
-        # 27-stripe number is unusable, so do not re-run f3caf9e9d1.
+        # History, so nobody re-runs a superseded commit:
+        #   f3caf9e9d1 - first diagnostics. Stripe audit found 27 skipped stripes
+        #                but had NO control, and printed "CONCLUSIVE" wrongly.
+        #   b72a1cc689 - added the std::thread control + proof-of-life counters.
+        #                RESULT: 112 stripes lost under the built-in backend in
+        #                CONTIGUOUS runs (worst: 86 consecutive, 911..996, the
+        #                entire tail, at nthreads=4), control clean at 0. That is
+        #                the finding. But the A/B step HUNG (>58 min vs 1m09s the
+        #                run before) on repeated scheduler create/destroy.
+        #   1c08400f4d - this one. Two fixes: (a) the standalone audit now runs
+        #                997 tasks at EVERY thread count -- it previously scaled
+        #                tasks with threads (64 tasks at 4 threads) and so never
+        #                exercised the combination that actually fails, which is
+        #                why it looked like it exonerated PPL; (b) the A/B test
+        #                hoists the thread-count loop outermost, cutting
+        #                setNumThreads calls from 764 to ~39 per backend (the
+        #                suspected cause of the hang), and prints per-count
+        #                progress so a hang is distinguishable from slow work.
         #
-        # Expect CMake's "Version control:" line to read 4.14.0-<n>-gb72a1cc689.
-        git fetch https://github.com/Prasadayus/opencv.git b72a1cc6897b4abb2cd31644b0768d7dac214095
+        # What this run decides: if the audit reports "[2] indices never
+        # executed > 0" at 997 tasks, raw Concurrency::parallel_for is failing to
+        # execute part of its own range with NO OpenCV linked -> PPL's bug,
+        # proven. If it stays clean, the defect is in how OpenCV drives PPL
+        # (Attach/Detach at parallel.cpp:600-609, or the global pplScheduler that
+        # setNumThreads destroys and recreates at :762-767).
+        #
+        # Expect CMake's "Version control:" line to read 4.14.0-<n>-g1c08400f4d.
+        git fetch https://github.com/Prasadayus/opencv.git 1c08400f4d7ec80dd30f9455c2b14946b2fb1ac2
         git checkout FETCH_HEAD
         echo "Checked out commit: $(git rev-parse HEAD)"
         git log -1 --stat
