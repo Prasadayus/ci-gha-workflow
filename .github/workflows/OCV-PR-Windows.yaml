@@ -130,18 +130,70 @@ jobs:
           --dst '${{ env.DNN_MODELS }}/dnn'
         echo "OPENCV_DNN_TEST_DATA_PATH=${{ env.DNN_MODELS }}" >> $GITHUB_ENV
 
-    # TEMP (diagnostic, REVERT before merge): cherry-pick SavyaSanchi-Sharma's
-    # pplScheduler mutex fix (opencv#issue/ppl branch, commit 5104fe7) onto
-    # stock 5.x, to test whether it eliminates the multithreading failures
-    # under the default PPL backend. Only this one commit, not the full
-    # 14-commit branch, since the rest hasn't been reviewed.
-    - name: (TEMP) Cherry-pick pplScheduler mutex fix
+    # TEMP (diagnostic, REVERT before merge): inject a plain, minimal probe
+    # isolating one specific question -- does Concurrency::parallel_for's
+    # spawn/join relationship reliably make a value written by the calling
+    # thread immediately before dispatch visible to every worker lambda, with
+    # zero explicit synchronization on our part? This is a direct analog of
+    # modules/core/src/parallel.cpp:214 (the write) and :340 (the read),
+    # stripped down to nothing else -- if it races here, on this exact CI
+    # hardware, the gap is in PPL/ConcRT's runtime itself, not in anything
+    # OpenCV's parallel.cpp does. Ran clean (0 stale / 200,000,000 reads) on a
+    # local Snapdragon X (Oryon) machine; this runner is different silicon
+    # (the Cobalt 100/Neoverse-class chip the original Core_Rand failure was
+    # actually observed on), so that result doesn't settle the question here.
+    - name: (TEMP) Add ctx-handoff probe test
       if: ${{ matrix.arch == 'arm64' }}
-      working-directory: '${{ github.workspace }}/opencv'
       shell: bash
+      working-directory: '${{ github.workspace }}'
       run: |
-        git fetch https://github.com/SavyaSanchi-Sharma/opencv.git 5104fe77f6130c6b4705c6a748251fa8a890a762
-        git cherry-pick FETCH_HEAD
+        cat > opencv/modules/core/test/test_ctx_handoff_probe.cpp <<'EOF'
+        #include "test_precomp.hpp"
+        #if defined(_WIN32) && defined(_MSC_VER) && _MSC_VER >= 1600
+        #include <ppl.h>
+        #include <atomic>
+
+        namespace opencv_test { namespace {
+
+        TEST(CtxHandoffProbe, repeated_trials)
+        {
+            const int NUM_ROWS = 1000;
+            const long long NUM_TRIALS = 50000;
+            long long ctxValue = -1;
+            std::atomic<long long> totalReads{0};
+            std::atomic<long long> staleReads{0};
+            long long firstStaleTrial = -1;
+            long long firstStaleObserved = -1;
+
+            printf("=== CTX HANDOFF PROBE: starting %lld trials x %d workers ===\n", NUM_TRIALS, NUM_ROWS);
+
+            for (long long trial = 0; trial < NUM_TRIALS; ++trial)
+            {
+                ctxValue = trial;
+                Concurrency::parallel_for(0, NUM_ROWS, [&](int) {
+                    long long observed = ctxValue;
+                    totalReads.fetch_add(1, std::memory_order_relaxed);
+                    if (observed != trial)
+                    {
+                        long long prevStale = staleReads.fetch_add(1, std::memory_order_relaxed);
+                        if (prevStale == 0) { firstStaleTrial = trial; firstStaleObserved = observed; }
+                    }
+                });
+            }
+
+            long long total = totalReads.load();
+            long long stale = staleReads.load();
+            printf("=== CTX HANDOFF PROBE RESULT: total=%lld stale=%lld pct=%.6f ===\n",
+                   total, stale, total ? 100.0 * (double)stale / (double)total : 0.0);
+            if (stale > 0)
+                printf("=== CTX HANDOFF PROBE FIRST STALE: trial=%lld observed=%lld ===\n",
+                       firstStaleTrial, firstStaleObserved);
+        }
+
+        }} // namespace
+        #endif // _WIN32 && _MSC_VER
+        EOF
+        echo "wrote probe:"; ls -l opencv/modules/core/test/test_ctx_handoff_probe.cpp
 
     # TEMP (diagnostic, REVERT before merge): inject a core-to-core cache-line
     # ping-pong probe into core/test (auto-globbed into opencv_test_core), to
@@ -247,6 +299,27 @@ jobs:
       working-directory: '${{ github.workspace }}'
       shell: bash
       run: ./build/bin/Release/opencv_test_core.exe --gtest_filter='CoreLatencyProbe.*'
+
+    # TEMP (diagnostic, REVERT before merge): run the standalone ctx-handoff
+    # probe injected above, on the actual CI hardware this whole question is
+    # about.
+    - name: (TEMP) Run ctx-handoff probe
+      if: ${{ always() && matrix.arch == 'arm64' }}
+      working-directory: '${{ github.workspace }}'
+      shell: bash
+      run: ./build/bin/Release/opencv_test_core.exe --gtest_filter='CtxHandoffProbe.*'
+
+    # TEMP (diagnostic, REVERT before merge): the real, unmodified OpenCV test
+    # this whole investigation started from -- repeated 2000x in one process,
+    # closer to the actual conditions (real-sized context object, OpenCV's
+    # full layered dispatch, not a stripped-down analog) than the probe above.
+    # Never confirmed locally on Snapdragon/Oryon either -- every prior
+    # failure came only from official CI on this runner's hardware.
+    - name: (TEMP) Run Core_Rand.parallel_for_stable_results repeated
+      if: ${{ always() && matrix.arch == 'arm64' }}
+      working-directory: '${{ github.workspace }}'
+      shell: bash
+      run: ./build/bin/Release/opencv_test_core.exe --gtest_filter='Core_Rand.parallel_for_stable_results' --gtest_repeat=2000
 
     - name: Run OpenCV tests
       uses: ./run-tests
