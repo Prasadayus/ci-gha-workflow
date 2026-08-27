@@ -34,9 +34,12 @@ jobs:
         - id: determine-branches
           shell: bash
           run: |
-            # TEMP (diagnostic, REVERT before merge): restrict to 5.x only for
-            # the core-latency probe experiment, to keep CI turnaround fast.
-            echo "branches=[ '5.x' ]" >> "$GITHUB_OUTPUT"
+            # TEMP (diagnostic, REVERT before merge): 4.x only -- validating
+            # the contours_truco.cpp / pencil-sketch / initInterTab2D fixes,
+            # which currently live on the 4.x fork commit being pulled in
+            # below. 5.x would need its own port (contours_truco.cpp has
+            # already diverged between branches).
+            echo "branches=[ '4.x' ]" >> "$GITHUB_OUTPUT"
 
   Windows:
     runs-on: ${{ matrix.runner }}
@@ -119,6 +122,22 @@ jobs:
         source_branch: "${{ github.event.repository.name == 'ci-gha-workflow' && '' || github.head_ref }}"
         gitcache: '${{ env.GIT_CACHE }}'
         workdir: '${{ github.workspace }}'
+
+    # TEMP (diagnostic, REVERT before merge): this workflow is triggered by
+    # pushing directly to ci-gha-workflow, so checkout-and-merge's own
+    # author/source_branch fork-merge path never fires (it's gated on
+    # github.event.repository.name != 'ci-gha-workflow', which is false
+    # here) -- pull the fork commit in directly instead, same as the earlier
+    # cherry-pick step did. Prasadayus/opencv#64: contours_truco.cpp
+    # connected-components redesign + pencil-sketch stale-variable fix +
+    # initInterTab2D std::call_once fix, all currently on 4.x.
+    - name: (TEMP) Pull in confirmed fixes from opencv fork
+      if: ${{ matrix.arch == 'arm64' }}
+      working-directory: '${{ github.workspace }}/opencv'
+      shell: bash
+      run: |
+        git fetch https://github.com/Prasadayus/opencv.git c301419e35b2419067a2ff2677945dbd153581ef
+        git merge --no-edit FETCH_HEAD
 
     - name: Update extra dnn models
       if: ${{ matrix.arch != 'arm64' }}
