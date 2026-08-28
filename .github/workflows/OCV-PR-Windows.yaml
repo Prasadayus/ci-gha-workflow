@@ -34,11 +34,9 @@ jobs:
         - id: determine-branches
           shell: bash
           run: |
-            # TEMP (diagnostic, REVERT before merge): 4.x only -- validating
-            # the contours_truco.cpp / pencil-sketch / initInterTab2D fixes,
-            # which currently live on the 4.x fork commit being pulled in
-            # below. 5.x would need its own port (contours_truco.cpp has
-            # already diverged between branches).
+            # TEMP (diagnostic, REVERT before merge): 4.x only -- the
+            # parallel.cpp partitioner fix being validated lives on the 4.x
+            # fork commit pinned below. Port to 5.x once it is confirmed.
             echo "branches=[ '4.x' ]" >> "$GITHUB_OUTPUT"
 
   Windows:
@@ -67,8 +65,8 @@ jobs:
         shell: bash
     # TEMP (diagnostic, REVERT before merge): -DWITH_OPENMP=ON removed from
     # CMAKE_OPT below so this build uses the DEFAULT parallel backend
-    # (ms-concurrency/PPL), to check the core-latency probe's numbers against
-    # the default build rather than only the already-fixed OpenMP build.
+    # (ms-concurrency/PPL) -- that is the backend under test. Adding OpenMP back
+    # would sidestep the bug instead of exercising the fix.
     env:
       CMAKE_OPT: >-
         -DCL_Z_OPTION=/Z7
@@ -127,10 +125,7 @@ jobs:
     # pushing directly to ci-gha-workflow, so checkout-and-merge's own
     # author/source_branch fork-merge path never fires (it's gated on
     # github.event.repository.name != 'ci-gha-workflow', which is false
-    # here) -- pull the fork commit in directly instead, same as the earlier
-    # cherry-pick step did. Prasadayus/opencv#64: contours_truco.cpp
-    # connected-components redesign + pencil-sketch stale-variable fix +
-    # initInterTab2D std::call_once fix, all currently on 4.x.
+    # here) -- pull the fork commit in directly instead.
     #
     # Checked out directly (detached HEAD at this exact SHA) rather than
     # merged -- a merge creates a new, unpredictable commit hash each run,
@@ -139,71 +134,33 @@ jobs:
     # obviously match a merge commit's hash). Checking out the fork commit
     # directly means that line is directly traceable to a known, specific
     # SHA -- no ambiguity about what was actually tested.
-    - name: (TEMP) Pin to diagnostics commit from opencv fork
+    - name: (TEMP) Pin to partitioner-fix commit from opencv fork
       if: ${{ matrix.arch == 'arm64' }}
       working-directory: '${{ github.workspace }}/opencv'
       shell: bash
       run: |
-        # 1c08400f4d = c301419e35 (the three fixes: contours_truco.cpp
-        # connected-components redesign, npr.hpp stale-temp fix, imgwarp.cpp
-        # call_once) PLUS the OpenCV-vs-PPL diagnostics run by the steps at the
-        # end of this job: ppl_contract_audit.cpp,
-        # modules/imgproc/test/test_parallel_backend_ab.cpp, and a DISABLED_
-        # ColorYUV size sweep in test_cvtyuv.cpp (inert -- nothing invokes it).
+        # a19e18d4a3 = stock upstream 4.x + ONLY modules/core/src/parallel.cpp,
+        # which stops PPL picking its default auto_partitioner on ARM64. That
+        # partitioner distributes work incorrectly there: whole contiguous chunks
+        # of a parallel_for range are silently never executed. Unfixed MSVC bug,
+        # developercommunity.visualstudio.com/t/1027444 (closed "Lower Priority").
         #
-        # History, so nobody re-runs a superseded commit:
-        #   f3caf9e9d1 - first diagnostics. Stripe audit found 27 skipped stripes
-        #                but had NO control, and printed "CONCLUSIVE" wrongly.
-        #   b72a1cc689 - added the std::thread control + proof-of-life counters.
-        #                RESULT: 112 stripes lost under the built-in backend in
-        #                CONTIGUOUS runs (worst: 86 consecutive, 911..996, the
-        #                entire tail, at nthreads=4), control clean at 0. That is
-        #                the finding. But the A/B step HUNG (>58 min vs 1m09s the
-        #                run before) on repeated scheduler create/destroy.
-        #   1c08400f4d - two fixes: (a) the standalone audit now runs 997 tasks at
-        #                EVERY thread count -- it previously scaled tasks with
-        #                threads (64 tasks at 4 threads) and so never exercised
-        #                the combination that actually fails, which is why it
-        #                looked like it exonerated PPL; (b) the A/B test hoists
-        #                the thread-count loop outermost, cutting setNumThreads
-        #                calls from 764 to ~39 per backend (the cause of the
-        #                hang), and prints per-count progress so a hang is
-        #                distinguishable from slow work. Both confirmed on CI:
-        #                A/B finished in 59s, stripe audit lost 638 stripes with
-        #                the control at 0. But the audit was still passing PPL a
-        #                LAMBDA, while OpenCV passes a polymorphic object -- and
-        #                Concurrency::parallel_for is a template on that type, so
-        #                its clean result only proved "PPL + lambda is fine".
-        #   833317883f - this one. The audit now runs TWO functor shapes per
-        #                config: (A) a plain lambda, and (B) a structural clone of
-        #                OpenCV's ProxyLoopBody -- polymorphic base with a vtable,
-        #                reference member, non-virtual int->Range forwarding hop,
-        #                the same range arithmetic from parallel.cpp:348-351, and
-        #                a final virtual call to the body. Shape B also mimics the
-        #                per-task TLS write at parallel.cpp:340 (theRNG() is real
-        #                TLS, rand.cpp:654) including OpenCV's locked, allocating
-        #                first-touch path (system.cpp:1847-1874). Still zero
-        #                OpenCV linked.
+        # The three earlier OpenCV-side fixes (contours_truco.cpp redesign,
+        # npr.hpp stale-temp, imgwarp.cpp call_once) are DELIBERATELY REVERTED
+        # here, so this run isolates the partitioner change. They remain in
+        # c301419e35 if any turns out to be needed. The diagnostics that found
+        # the bug (ppl_contract_audit.cpp, test_parallel_backend_ab.cpp) are kept.
         #
-        # What this run decides:
-        #   shape A clean, shape B FAILS -> PPL's bug, PROVEN. Same PPL, same
-        #       scheduler, same task count; only the functor type differs, and
-        #       that is what parallel_for's template instantiates on.
-        #   both FAIL -> PPL's bug, not shape-specific.
-        #   both clean -> the defect is in OpenCV's own dispatch path. Functor
-        #       shape and TLS are then both eliminated, leaving the per-call
-        #       Attach/Detach (parallel.cpp:600-609) and the global pplScheduler
-        #       that setNumThreads destroys and recreates (:762-767). Next step
-        #       would be instrumenting parallel.cpp in situ.
+        # What this run decides, from the stripe delivery audit below:
+        #   [built-in] skipped == 0  -> the partitioner fix works; the full test
+        #       suite then runs, and whatever it clears was PPL's bug all along.
+        #   [built-in] skipped  > 0  -> it does not; the suite is skipped
+        #       automatically (that step has no `if:`), costing no CI time.
+        # Anything still red with the suite green is a genuine OpenCV bug, and we
+        # will know exactly which module owns it.
         #
-        # Note: a local run showed "distinct threads seen by mimicked TLS: 77"
-        # against ~101 total virtual processors, i.e. PPL reuses a pool per
-        # scheduler rather than churning threads -- so the locked TLS first-touch
-        # fires ~77 times, not thousands. TLS contention is therefore already a
-        # weak candidate before this run.
-        #
-        # Expect CMake's "Version control:" line to read 4.14.0-<n>-g833317883f.
-        git fetch https://github.com/Prasadayus/opencv.git 833317883f33929d47dac5ba17eb71cd55a21519
+        # Expect CMake's "Version control:" line to read 4.14.0-<n>-ga19e18d4a3.
+        git fetch https://github.com/Prasadayus/opencv.git a19e18d4a393fd06c45b512bbaca7b7b54850bea
         git checkout FETCH_HEAD
         echo "Checked out commit: $(git rev-parse HEAD)"
         git log -1 --stat
@@ -332,23 +289,16 @@ jobs:
       shell: bash
       run: ./build/bin/Release/opencv_test_imgproc.exe --gtest_also_run_disabled_tests --gtest_filter='*stripe_delivery_audit*'
 
-    # The substitution experiment, run where the failure actually reproduces.
-    # Swaps ONLY the thread pool (a plain std::thread pool, via the public
-    # cv::parallel::setParallelForBackend) while holding the stripe count,
-    # stripe->Range mapping, RNG propagation and exception capture identical --
-    # a custom backend's parallel_for_cb(i, i+1) reaches the very same
-    # ParallelLoopBodyWrapper::operator()(Range(i, i+1)) that PPL's
-    # ProxyLoopBody::operator()(int i) produces.
-    #   Both backends diverge -> OpenCV defect, proven (fails with PPL removed).
-    #   Only the built-in diverges -> strong evidence for the runtime.
-    # Note this reports rather than asserts on the built-in backend, so the step
-    # passing does NOT mean "no problem" -- read the printed verdict block.
-    - name: (TEMP) Backend A/B swap (PPL vs std::thread)
-      if: ${{ always() && matrix.arch == 'arm64' }}
-      working-directory: '${{ github.workspace }}'
-      shell: bash
-      run: ./build/bin/Release/opencv_test_imgproc.exe --gtest_also_run_disabled_tests --gtest_filter='*findContours_ppl_vs_stdthread*'
-
+    # NOTE: the "(TEMP) Backend A/B swap" step (findContours under PPL vs a
+    # std::thread pool) was removed -- it hung for >58 min on one run, and the
+    # stripe audit above already carries its own std::thread control, so it was
+    # redundant. Filter if it is ever needed again:
+    #   --gtest_filter='*findContours_ppl_vs_stdthread*'
+    #
+    # This step deliberately runs LAST and has no `if:` condition, so it is
+    # skipped automatically when a diagnostic above fails. That is intentional:
+    # if the partitioner fix did not work, there is no point spending ~30 min on
+    # 27 test binaries.
     - name: Run OpenCV tests
       uses: ./run-tests
       env:
