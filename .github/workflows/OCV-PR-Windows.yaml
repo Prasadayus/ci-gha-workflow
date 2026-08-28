@@ -160,25 +160,50 @@ jobs:
         #                entire tail, at nthreads=4), control clean at 0. That is
         #                the finding. But the A/B step HUNG (>58 min vs 1m09s the
         #                run before) on repeated scheduler create/destroy.
-        #   1c08400f4d - this one. Two fixes: (a) the standalone audit now runs
-        #                997 tasks at EVERY thread count -- it previously scaled
-        #                tasks with threads (64 tasks at 4 threads) and so never
-        #                exercised the combination that actually fails, which is
-        #                why it looked like it exonerated PPL; (b) the A/B test
-        #                hoists the thread-count loop outermost, cutting
-        #                setNumThreads calls from 764 to ~39 per backend (the
-        #                suspected cause of the hang), and prints per-count
-        #                progress so a hang is distinguishable from slow work.
+        #   1c08400f4d - two fixes: (a) the standalone audit now runs 997 tasks at
+        #                EVERY thread count -- it previously scaled tasks with
+        #                threads (64 tasks at 4 threads) and so never exercised
+        #                the combination that actually fails, which is why it
+        #                looked like it exonerated PPL; (b) the A/B test hoists
+        #                the thread-count loop outermost, cutting setNumThreads
+        #                calls from 764 to ~39 per backend (the cause of the
+        #                hang), and prints per-count progress so a hang is
+        #                distinguishable from slow work. Both confirmed on CI:
+        #                A/B finished in 59s, stripe audit lost 638 stripes with
+        #                the control at 0. But the audit was still passing PPL a
+        #                LAMBDA, while OpenCV passes a polymorphic object -- and
+        #                Concurrency::parallel_for is a template on that type, so
+        #                its clean result only proved "PPL + lambda is fine".
+        #   833317883f - this one. The audit now runs TWO functor shapes per
+        #                config: (A) a plain lambda, and (B) a structural clone of
+        #                OpenCV's ProxyLoopBody -- polymorphic base with a vtable,
+        #                reference member, non-virtual int->Range forwarding hop,
+        #                the same range arithmetic from parallel.cpp:348-351, and
+        #                a final virtual call to the body. Shape B also mimics the
+        #                per-task TLS write at parallel.cpp:340 (theRNG() is real
+        #                TLS, rand.cpp:654) including OpenCV's locked, allocating
+        #                first-touch path (system.cpp:1847-1874). Still zero
+        #                OpenCV linked.
         #
-        # What this run decides: if the audit reports "[2] indices never
-        # executed > 0" at 997 tasks, raw Concurrency::parallel_for is failing to
-        # execute part of its own range with NO OpenCV linked -> PPL's bug,
-        # proven. If it stays clean, the defect is in how OpenCV drives PPL
-        # (Attach/Detach at parallel.cpp:600-609, or the global pplScheduler that
-        # setNumThreads destroys and recreates at :762-767).
+        # What this run decides:
+        #   shape A clean, shape B FAILS -> PPL's bug, PROVEN. Same PPL, same
+        #       scheduler, same task count; only the functor type differs, and
+        #       that is what parallel_for's template instantiates on.
+        #   both FAIL -> PPL's bug, not shape-specific.
+        #   both clean -> the defect is in OpenCV's own dispatch path. Functor
+        #       shape and TLS are then both eliminated, leaving the per-call
+        #       Attach/Detach (parallel.cpp:600-609) and the global pplScheduler
+        #       that setNumThreads destroys and recreates (:762-767). Next step
+        #       would be instrumenting parallel.cpp in situ.
         #
-        # Expect CMake's "Version control:" line to read 4.14.0-<n>-g1c08400f4d.
-        git fetch https://github.com/Prasadayus/opencv.git 1c08400f4d7ec80dd30f9455c2b14946b2fb1ac2
+        # Note: a local run showed "distinct threads seen by mimicked TLS: 77"
+        # against ~101 total virtual processors, i.e. PPL reuses a pool per
+        # scheduler rather than churning threads -- so the locked TLS first-touch
+        # fires ~77 times, not thousands. TLS contention is therefore already a
+        # weak candidate before this run.
+        #
+        # Expect CMake's "Version control:" line to read 4.14.0-<n>-g833317883f.
+        git fetch https://github.com/Prasadayus/opencv.git 833317883f33929d47dac5ba17eb71cd55a21519
         git checkout FETCH_HEAD
         echo "Checked out commit: $(git rev-parse HEAD)"
         git log -1 --stat
