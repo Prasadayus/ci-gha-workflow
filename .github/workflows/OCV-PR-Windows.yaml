@@ -181,6 +181,35 @@ jobs:
         suffix: '${{ matrix.arch }}_${{ matrix.branch }}'
         timeout: 15
 
+    # TEMP (REVERT before merge): exercise the contrib suite too, against the
+    # build-contrib tree. Upstream normally leaves contrib to the separate
+    # OCV-Contrib-PR-* workflows, so this is only here to check contrib modules
+    # against the fixed core (they contain no PPL code of their own -- they just
+    # link opencv_core, so the parallel.cpp fix reaches them automatically).
+    #
+    # always() so it still runs when the main suite above reports failures --
+    # otherwise one main-module failure would hide the whole contrib result.
+    # Separate log suffix so the two passes do not overwrite each other.
+    - name: (TEMP) Run OpenCV contrib tests
+      if: ${{ always() && github.event.repository.name != 'opencv_contrib' }}
+      uses: ./run-tests
+      env:
+        OPENCV_TEST_DATA_PATH: '${{ github.workspace }}/opencv_extra/testdata'
+        OPENCV_TEST_REQUIRE_DATA: ${{ matrix.arch == 'arm64' && '0' || '1' }}
+        OPENCV_TEST_CHECK_OPTIONAL_DATA: ${{ matrix.arch == 'arm64' && '0' || '1' }}
+        OPENCV_OPENCL_RUNTIME: 'disabled'
+      with:
+        workdir: '${{ github.workspace }}'
+        builddir: 'build-contrib'
+        logdir: '${{ github.workspace }}'
+        plan: "test-plan-win-${{ matrix.branch }}.json"
+        suite: "[ 'contrib' ]"
+        enable_python: "false"
+        enable_java: "false"
+        filter: "[ 'windows-common' ]"
+        suffix: 'contrib_${{ matrix.arch }}_${{ matrix.branch }}'
+        timeout: 15
+
     - if: ${{ always() && env.WARNINGS == '1' }}
       name: Warnings check
       run: |
