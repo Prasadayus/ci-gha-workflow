@@ -35,9 +35,9 @@ jobs:
           shell: bash
           run: |
             if [ "${{ github.event.repository.name == 'ci-gha-workflow' }}" = "true" ] ; then
-              # TEMP (REVERT before merge): 5.x only while testing the PPL + ASM fixes.
+              # TEMP (REVERT before merge): 4.x only while testing the PPL fix.
               # Restore [ '4.x', '5.x' ] before this goes upstream.
-              echo "branches=[ '5.x' ]" >> "$GITHUB_OUTPUT"
+              echo "branches=[ '4.x' ]" >> "$GITHUB_OUTPUT"
             else
               echo "branches=[ '${{ github.base_ref }}' ]" >> "$GITHUB_OUTPUT"
             fi
@@ -123,14 +123,14 @@ jobs:
     # fork. checkout-and-merge's own fork-merge path is gated on
     # github.event.repository.name != 'ci-gha-workflow', which is false when this
     # workflow is triggered by pushing here directly -- so fetch it explicitly.
-    # Fetches the branch head, so it always picks up the latest commit pushed there.
-    # (the fork's own 5.x tracks upstream and does NOT carry the fixes)
-    - name: (TEMP) Pin to partitioner-fix branch from opencv fork
+    # Fetches refs/pull/66/head, so it always tracks the PR's current head:
+    #   https://github.com/Prasadayus/opencv/pull/66  (4.x <- fix/ppl-arm-4x)
+    - name: (TEMP) Pin to partitioner-fix PR from opencv fork
       if: ${{ matrix.arch == 'arm64' }}
       working-directory: '${{ github.workspace }}/opencv'
       shell: bash
       run: |
-        git fetch https://github.com/Prasadayus/opencv.git fix/ppl-arm
+        git fetch https://github.com/Prasadayus/opencv.git refs/pull/66/head
         git checkout FETCH_HEAD
         echo "Checked out commit: $(git rev-parse HEAD)"
         git log -1 --stat
