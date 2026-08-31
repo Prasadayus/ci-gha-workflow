@@ -35,7 +35,9 @@ jobs:
           shell: bash
           run: |
             if [ "${{ github.event.repository.name == 'ci-gha-workflow' }}" = "true" ] ; then
-              echo "branches=[ '4.x', '5.x' ]" >> "$GITHUB_OUTPUT"
+              # TEMP (REVERT before merge): 5.x only while testing the PPL + ASM fixes.
+              # Restore [ '4.x', '5.x' ] before this goes upstream.
+              echo "branches=[ '5.x' ]" >> "$GITHUB_OUTPUT"
             else
               echo "branches=[ '${{ github.base_ref }}' ]" >> "$GITHUB_OUTPUT"
             fi
@@ -70,7 +72,6 @@ jobs:
         -DBUILD_EXAMPLES=ON
         -DOPENCV_ENABLE_NONFREE=ON
         -DCMAKE_BUILD_TYPE=Release
-        ${{ matrix.arch == 'arm64' && '-DCMAKE_ASM_COMPILER=CMAKE_ASM_COMPILER-NOTFOUND' || '' }}
         ${{ matrix.no_opencl && '-DWITH_OPENCL=OFF' || '' }}
         ${{ matrix.arch == 'x86' && '-DBUILD_opencv_python3=OFF' || '' }}
       MAIN_BUILD_DIR: "${{ (github.event.repository.name != 'opencv_contrib') && 'build' || 'build-contrib' }}"
@@ -122,14 +123,14 @@ jobs:
     # fork. checkout-and-merge's own fork-merge path is gated on
     # github.event.repository.name != 'ci-gha-workflow', which is false when this
     # workflow is triggered by pushing here directly -- so fetch it explicitly.
-    #   4.x -> probe/win-arm      5.x -> fix/ppl-arm
-    # (the fork's own 4.x / 5.x track upstream and do NOT carry the fix)
+    # Fetches the branch head, so it always picks up the latest commit pushed there.
+    # (the fork's own 5.x tracks upstream and does NOT carry the fixes)
     - name: (TEMP) Pin to partitioner-fix branch from opencv fork
       if: ${{ matrix.arch == 'arm64' }}
       working-directory: '${{ github.workspace }}/opencv'
       shell: bash
       run: |
-        git fetch https://github.com/Prasadayus/opencv.git ${{ matrix.branch == '4.x' && 'probe/win-arm' || 'fix/ppl-arm' }}
+        git fetch https://github.com/Prasadayus/opencv.git fix/ppl-arm
         git checkout FETCH_HEAD
         echo "Checked out commit: $(git rev-parse HEAD)"
         git log -1 --stat
@@ -179,35 +180,6 @@ jobs:
         enable_java: "false"
         filter: "[ 'windows-common' ]"
         suffix: '${{ matrix.arch }}_${{ matrix.branch }}'
-        timeout: 15
-
-    # TEMP (REVERT before merge): exercise the contrib suite too, against the
-    # build-contrib tree. Upstream normally leaves contrib to the separate
-    # OCV-Contrib-PR-* workflows, so this is only here to check contrib modules
-    # against the fixed core (they contain no PPL code of their own -- they just
-    # link opencv_core, so the parallel.cpp fix reaches them automatically).
-    #
-    # always() so it still runs when the main suite above reports failures --
-    # otherwise one main-module failure would hide the whole contrib result.
-    # Separate log suffix so the two passes do not overwrite each other.
-    - name: (TEMP) Run OpenCV contrib tests
-      if: ${{ always() && github.event.repository.name != 'opencv_contrib' }}
-      uses: ./run-tests
-      env:
-        OPENCV_TEST_DATA_PATH: '${{ github.workspace }}/opencv_extra/testdata'
-        OPENCV_TEST_REQUIRE_DATA: ${{ matrix.arch == 'arm64' && '0' || '1' }}
-        OPENCV_TEST_CHECK_OPTIONAL_DATA: ${{ matrix.arch == 'arm64' && '0' || '1' }}
-        OPENCV_OPENCL_RUNTIME: 'disabled'
-      with:
-        workdir: '${{ github.workspace }}'
-        builddir: 'build-contrib'
-        logdir: '${{ github.workspace }}'
-        plan: "test-plan-win-${{ matrix.branch }}.json"
-        suite: "[ 'contrib' ]"
-        enable_python: "false"
-        enable_java: "false"
-        filter: "[ 'windows-common' ]"
-        suffix: 'contrib_${{ matrix.arch }}_${{ matrix.branch }}'
         timeout: 15
 
     - if: ${{ always() && env.WARNINGS == '1' }}
