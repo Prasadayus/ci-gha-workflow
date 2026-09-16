@@ -80,7 +80,7 @@ jobs:
       uses: ./checkout-and-merge
       with:
         target_branch: "${{ matrix.branch }}"
-        author: "${{ github.event.pull_request.user.login }}"
+        author: "${{ github.event.pull_request.head.repo.owner.login }}"
         source_branch: "${{ github.event.repository.name == 'ci-gha-workflow' && '' || github.head_ref }}"
         gitcache: '/opt/git_cache'
         home: '${{ env.HOME }}'
@@ -90,7 +90,6 @@ jobs:
       timeout-minutes: 60
       working-directory: '${{ env.HOME }}'
       run: |
-        ls -lR ${{ env.DNN_MODELS }}
         python3 opencv_extra/testdata/dnn/download_models.py \
           --cleanup \
           --dst '${{ env.DNN_MODELS }}/dnn'
