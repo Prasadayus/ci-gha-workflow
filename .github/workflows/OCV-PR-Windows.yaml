@@ -67,8 +67,8 @@ jobs:
             cmake_arch: x64
           - arch: arm64
             config: base
-            runner: windows-11-arm
-            # windows-11-arm now ships VS 2026 only; VS 2022 is no longer present on the image.
+            # windows-11-arm's default image dropped VS 2022; pin the VS2026-specific label instead.
+            runner: windows-11-vs2026-arm
             vs: 'Visual Studio 18 2026'
             cmake_arch: ARM64
             no_opencl: true
