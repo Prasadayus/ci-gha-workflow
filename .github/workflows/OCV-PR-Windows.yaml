@@ -76,6 +76,8 @@ jobs:
     defaults:
       run:
         shell: bash
+    # TEMP (REVERT before merge): the pinned fork branch predates the CMakeLists ASM guard, so
+    # CMAKE_OPT below blocks MinGW's cc.exe from being picked up as the ASM compiler on this runner.
     env:
       CMAKE_OPT: >-
         -DCL_Z_OPTION=/Z7
@@ -84,6 +86,7 @@ jobs:
         -DCMAKE_BUILD_TYPE=Release
         ${{ matrix.no_opencl && '-DWITH_OPENCL=OFF' || '' }}
         ${{ matrix.arch == 'x86' && '-DBUILD_opencv_python3=OFF' || '' }}
+        ${{ matrix.arch == 'arm64' && '-DCMAKE_ASM_COMPILER=CMAKE_ASM_COMPILER-NOTFOUND' || '' }}
       MAIN_BUILD_DIR: "${{ (github.event.repository.name != 'opencv_contrib') && 'build' || 'build-contrib' }}"
       OPENCV_FOR_THREADS_NUM: 8
       CMAKE_BUILD_PARALLEL_LEVEL: 8
