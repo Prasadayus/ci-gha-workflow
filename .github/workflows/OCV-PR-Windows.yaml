@@ -35,7 +35,9 @@ jobs:
           shell: bash
           run: |
             if [ "${{ github.event.repository.name == 'ci-gha-workflow' }}" = "true" ] ; then
-              echo "branches=[ '4.x', '5.x' ]" >> "$GITHUB_OUTPUT"
+              # TEMP (REVERT before merge): 5.x only while validating the PPL rebalance fix.
+              # Restore [ '4.x', '5.x' ] before this goes upstream.
+              echo "branches=[ '5.x' ]" >> "$GITHUB_OUTPUT"
             else
               echo "branches=[ '${{ github.base_ref }}' ]" >> "$GITHUB_OUTPUT"
             fi
@@ -65,8 +67,9 @@ jobs:
             cmake_arch: x64
           - arch: arm64
             config: base
-            runner: windows-arm64
-            vs: 'Visual Studio 17 2022'
+            # windows-11-arm's default image dropped VS 2022; pin the VS2026-specific label instead.
+            runner: windows-11-vs2026-arm
+            vs: 'Visual Studio 18 2026'
             cmake_arch: ARM64
             no_opencl: true
 
@@ -74,6 +77,8 @@ jobs:
     defaults:
       run:
         shell: bash
+    # TEMP (REVERT before merge): the pinned fork branch predates the CMakeLists ASM guard, so
+    # CMAKE_OPT below blocks MinGW's cc.exe from being picked up as the ASM compiler on this runner.
     env:
       CMAKE_OPT: >-
         -DCL_Z_OPTION=/Z7
@@ -82,6 +87,7 @@ jobs:
         -DCMAKE_BUILD_TYPE=Release
         ${{ matrix.no_opencl && '-DWITH_OPENCL=OFF' || '' }}
         ${{ matrix.arch == 'x86' && '-DBUILD_opencv_python3=OFF' || '' }}
+        ${{ matrix.arch == 'arm64' && '-DCMAKE_ASM_COMPILER=CMAKE_ASM_COMPILER-NOTFOUND' || '' }}
       MAIN_BUILD_DIR: "${{ (github.event.repository.name != 'opencv_contrib') && 'build' || 'build-contrib' }}"
       OPENCV_FOR_THREADS_NUM: 8
       CMAKE_BUILD_PARALLEL_LEVEL: 8
@@ -126,6 +132,21 @@ jobs:
         source_branch: "${{ github.event.repository.name == 'ci-gha-workflow' && '' || github.head_ref }}"
         gitcache: '${{ env.GIT_CACHE }}'
         workdir: '${{ github.workspace }}'
+
+    # TEMP (REVERT before merge): pull the PPL rebalance fix from the fork.
+    # checkout-and-merge's own fork-merge path is gated on
+    # github.event.repository.name != 'ci-gha-workflow', which is false when this
+    # workflow is triggered by pushing here directly, so fetch it explicitly.
+    # Fetches the branch head, so it always picks up the latest commit pushed there.
+    - name: (TEMP) Pin to optimize/ppl-arm64-rebalance from opencv fork
+      if: ${{ matrix.arch == 'arm64' }}
+      working-directory: '${{ github.workspace }}/opencv'
+      shell: bash
+      run: |
+        git fetch https://github.com/Prasadayus/opencv.git optimize/ppl-arm64-rebalance
+        git checkout FETCH_HEAD
+        echo "Checked out commit: $(git rev-parse HEAD)"
+        git log -1 --stat
 
     - name: Update extra dnn models
       if: ${{ matrix.arch != 'arm64' }}
